@@ -21,6 +21,9 @@ function App() {
 
   const [FileUploadDisable, setFileUploadDisable] = useState(false);
   const [uuid, setuuid] = useState("");
+  const [email, setEmail] = useState(false);
+  const [downloadLink, setDownloadLink] = useState('');
+
 
   const handleChange = async (event) => {
     event.preventDefault();
@@ -38,7 +41,6 @@ function App() {
       setuuid(uuidv4());
     }
     setUpload(true);
-    
   };
 
   const handleClick = (event) => {
@@ -48,7 +50,7 @@ function App() {
   useEffect(() => {
     const email = document.getElementById("email").value;
     const params = { uuid: uuid, email: email };
-    if (email != "") {
+    if (email !== "") {
       axios
         .post(
           "https://i5ln09jpwf.execute-api.us-east-1.amazonaws.com/analysis-api/subscribe",
@@ -56,11 +58,11 @@ function App() {
         )
         .then((resp) => {
           console.log(resp);
+          setEmail(true);
         });
     }
     console.log(params);
   }, [uuid]);
-
 
   useEffect(() => {
     if (files.length > 0 && upload) {
@@ -76,36 +78,58 @@ function App() {
           fname: file.name,
           uuid: uuid,
           base64: file.base64,
+          subs: email,
         };
         console.log(file);
         console.log(params);
         let out;
-          axios
-            .post(
-              "https://i5ln09jpwf.execute-api.us-east-1.amazonaws.com/analysis-api/upload-to-s3",
-              { ...params }
-            )
-            .then((resp) => {
-              setFileUploadDisable(true);
-              console.log(params);
-              console.log(resp);
-              setFile((prev) =>
-                prev.map((f) => ({
-                  ...f,
-                  status: "Processing in Cloud Started",
-                }))
-              );
-              out = resp;
-            })
-            .catch((err) => {
-              alert(err);
-              setFile((prev) =>
-                prev.map((f) => ({
-                  ...f,
-                  status: "Upload Failed",
-                }))
-              );
-            });
+        axios
+          .post(
+            "https://i5ln09jpwf.execute-api.us-east-1.amazonaws.com/analysis-api/upload-to-s3",
+            { ...params }
+          )
+          .then((resp) => {
+            setFileUploadDisable(true);
+            console.log(params);
+            console.log(resp);
+            setFile((prev) =>
+              prev.map((f) => ({
+                ...f,
+                status: "Processing in Cloud Started",
+              }))
+            );
+
+            axios
+              .post(
+                "https://i5ln09jpwf.execute-api.us-east-1.amazonaws.com/analysis-api/download-file",
+                {
+                  fname: `${resp.data.uuid}/processed/${resp.data.fname}`,
+                }
+              )
+              .then((resp) => {
+                const blob = new Blob([resp.data.body], { type: "text/csv" });
+                console.log(resp)
+                const url = URL.createObjectURL(blob);
+                console.log(blob, url)
+                setDownloadLink(url)
+                setFile((prev) =>
+                  prev.map((f) => ({
+                    ...f,
+                    status: <a href={url} download="data.csv">Download Link</a>,
+                  }))
+                );
+              });
+            out = resp;
+          })
+          .catch((err) => {
+            alert(err);
+            setFile((prev) =>
+              prev.map((f) => ({
+                ...f,
+                status: "Upload Failed",
+              }))
+            );
+          });
         return out;
       });
     }
@@ -146,7 +170,7 @@ function App() {
               component="label"
               endIcon={<BackupOutlinedIcon />}
               onClick={handleSubmit}
-              // disabled={FileUploadDisable}
+              disabled={FileUploadDisable}
             >
               Upload
             </Button>
