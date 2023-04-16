@@ -1,0 +1,583 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Resources:
+  UploadedQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: UploadedQ
+  
+  UploadedQPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt TransFormData.Arn
+      Principal: sqs.amazonaws.com
+      SourceArn: !GetAtt UploadedQ.Arn
+
+  ProcessedQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: ProcessedQ
+
+  ProcessedQPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt SendNotification.Arn
+      Principal: sqs.amazonaws.com
+      SourceArn: !GetAtt ProcessedQ.Arn
+
+  FileDownloadQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: FileDownloadQ
+
+  UploadToS3:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: UploadS3
+      Role: arn:aws:iam::432954724596:role/LabRole
+      Timeout: 300
+      Runtime: python3.9
+      PackageType: Zip
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import base64
+
+          sqs = boto3.client('sqs')
+          s3 = boto3.client('s3');
+          def lambda_handler(event, context):
+              bucket_name = 'dpfilesdpgurukiran';
+              filename = event['fname']
+              data = base64.b64decode(event['base64'])
+              uuid = event['uuid']
+              message = ""
+              try:
+                  s3_resp = s3.put_object(Bucket=bucket_name, Key=f"{uuid}/{filename}", Body=data)
+                  message = 'File Upload Successful'
+                  sqs.send_message(
+                      QueueUrl="https://sqs.us-east-1.amazonaws.com/432954724596/UploadedQ",
+                      MessageBody=json.dumps({
+                          'message': message,
+                          'uuid': uuid,
+                          'fname': filename,
+                          's3_resp': s3_resp
+                      })
+                  )
+                  while ( True ):
+                      msg = sqs.receive_message(
+                          QueueUrl='https://sqs.us-east-1.amazonaws.com/432954724596/FileDownloadQ',
+                          WaitTimeSeconds=10
+                      )
+
+                      if (len(msg['Messages']) > 0):
+                          processed_file = f"{uuid}/processed_file/{filename}"
+                          rc_handle = msg['Messages'][0]['ReceiptHandle']
+                          sqs.delete_message(
+                              QueueUrl='https://sqs.us-east-1.amazonaws.com/432954724596/FileDownloadQ',
+                              ReceiptHandle=rc_handle
+                          )
+                          break
+
+              except Exception as e:
+                  message = 'File Upload Failed'
+                  processed_file = str(e)
+                  rc_handle = 'error'
+
+              return {
+                  'message': message,
+                  'uuid': uuid,
+                  'fname': filename,
+                  # 's3_resp': s3_resp,
+                  # 'processed_file': processed_file,
+                  # 'rh': rc_handle,
+                  # 'msg': msg
+              }
+
+
+  TransFormData:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: TransFormData
+      Role: arn:aws:iam::432954724596:role/LabRole
+      Runtime: python3.9
+      PackageType: Zip
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import pandas as pd
+          from io import StringIO
+
+          bucket_name = 'dpfilesdpgurukiran';
+          s3 = boto3.client('s3')
+
+
+          def load_s3_data(uuid, filename):
+              s3_resp = s3.get_object(
+                  Bucket=bucket_name,
+                  Key=f"{uuid}/{filename}"
+              )
+              return pd.read_csv(s3_resp['Body'])
+
+          def write_num_cols_stats(df):
+              num_stats = df.describe()
+              return num_stats
+
+          sns = boto3.client('sns')
+          sqs = boto3.client('sqs')
+
+          def lambda_handler(event, context):
+              req = json.loads(event['Records'][0]['body'])
+              df = load_s3_data(req['uuid'], req['fname'])
+              out = write_num_cols_stats(df)
+              outBody = out.reset_index().to_csv(index=False)
+              s3.put_object(Bucket=bucket_name, Key=f"{req['uuid']}/processed/{req['fname']}", Body=outBody)
+
+              sqs.send_message(
+                  QueueUrl='https://sqs.us-east-1.amazonaws.com/432954724596/ProcessedQ',
+                  MessageBody=json.dumps({
+                      'uuid': req['uuid']
+                  })
+              )
+              
+              sqs.send_message(
+                  QueueUrl='https://sqs.us-east-1.amazonaws.com/432954724596/FileDownloadQ',
+                  MessageBody=req['uuid']
+              )
+              return {}
+      Layers:
+        - arn:aws:lambda:us-east-1:336392948345:layer:AWSSDKPandas-Python39:5
+      Environment:
+        Variables:
+          QUEUE_NAME: !Ref UploadedQ
+
+  UploadedQMapping:
+      Type: AWS::Lambda::EventSourceMapping
+      Properties:
+        BatchSize: 1
+        Enabled: true
+        EventSourceArn: !GetAtt UploadedQ.Arn
+        FunctionName: !GetAtt TransFormData.Arn
+
+  SendNotification:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SendNotification
+      Role: arn:aws:iam::432954724596:role/LabRole
+      Runtime: python3.9
+      PackageType: Zip
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import json
+          import boto3 
+
+          sns = boto3.client('sns')
+          s3 = boto3.client('s3')
+          sqs = boto3.client('sqs')
+
+          def lambda_handler(event, context):
+              req = json.loads(event['Records'][0]['body'])
+              sns_res = sns.publish(
+                  TopicArn=f"arn:aws:sns:us-east-1:432954724596:{req['uuid']}_data_processor",
+                  Message="The file uploaded to the cloud has been processed",
+                  Subject="Cloud-proj File Processes Successfully"
+              )
+              
+              s3.put_object(
+                  Bucket='dpfilesdpgurukiran',
+                  Key=req['uuid']+ '.text',
+                  Body="abc"
+              )
+              
+              sns.delete_topic(
+                  TopicArn=f"arn:aws:sns:us-east-1:432954724596:{req['uuid']}_data_processor"
+              )
+              
+              sqs.delete_message(
+                  QueueUrl='https://sqs.us-east-1.amazonaws.com/432954724596/ProcessedQ',
+                  ReceiptHandle=event['Records'][0]['receiptHandle']
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Hello from Lambda!'),
+                  'uuid': req['uuid'],
+                  'sns': sns_res
+              } 
+      Environment:
+        Variables:
+          QUEUE_NAME: !Ref ProcessedQ
+
+  ProcessedQMapping:
+      Type: AWS::Lambda::EventSourceMapping
+      Properties:
+        BatchSize: 1
+        Enabled: true
+        EventSourceArn: !GetAtt ProcessedQ.Arn
+        FunctionName: !GetAtt SendNotification.Arn
+
+  NotificationHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: NotificationHandler
+      Role: arn:aws:iam::432954724596:role/LabRole
+      Runtime: python3.9
+      PackageType: Zip
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+
+          sns = boto3.client('sns')
+          def lambda_handler(event, context):
+              uuid = event['uuid']
+              resp = sns.create_topic(
+                  Name=f"{uuid}_data_processor",
+                  Attributes={'DisplayName': "Data Processor"}
+              )
+              
+              sns.subscribe(
+                  TopicArn=resp['TopicArn'],
+                  Protocol='email',
+                  Endpoint=event['email']
+              )
+              return resp
+
+  DownloadLink:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: DownloadLink
+      Role: arn:aws:iam::432954724596:role/LabRole
+      Runtime: python3.9
+      PackageType: Zip
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from io import StringIO
+          import pandas as pd
+          s3 = boto3.client('s3')
+
+          def lambda_handler(event, context):
+              bucket_name = 'dpfilesdpgurukiran'
+              filename = event['fname']
+
+              obj = s3.get_object(Bucket=bucket_name, Key=filename)
+              data = obj['Body'].read().decode('utf-8')
+              df = pd.read_csv(StringIO(data))
+              csv = df.to_csv(index=False)
+
+              return {
+                  "statusCode": 200,
+                  "headers": {
+                      "Content-Type": "text/csv",
+                      f"Content-Disposition": "attachment; filename=filename.csv"
+                  },
+                  "body": csv
+              }
+      Layers:
+        - arn:aws:lambda:us-east-1:336392948345:layer:AWSSDKPandas-Python39:5
+
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: dpfilesdpgurukiran
+
+  dpApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: dpApi
+
+  
+
+  UploadFileRes:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref dpApi
+      ParentId: !GetAtt
+        - dpApi
+        - RootResourceId
+      PathPart: upload-file
+    DependsOn:
+      - dpApi
+
+  RestApiCORSOptionMethod:
+      Type: "AWS::ApiGateway::Method"
+      Properties:
+        ResourceId: !Ref UploadFileRes
+        RestApiId: !Ref dpApi
+        AuthorizationType: NONE
+        HttpMethod: OPTIONS
+        Integration:
+          Type: MOCK
+          IntegrationResponses:
+            - ResponseParameters:
+                method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+                method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+                method.response.header.Access-Control-Allow-Origin: "'*'"
+              ResponseTemplates:
+                application/json: ''
+              StatusCode: '200'
+          PassthroughBehavior: NEVER
+          RequestTemplates:
+            application/json: '{"statusCode": 200}'
+        MethodResponses:
+          - ResponseModels:
+              application/json: Empty
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: true
+              method.response.header.Access-Control-Allow-Methods: true
+              method.response.header.Access-Control-Allow-Origin: true
+            StatusCode: '200'
+
+  UploadFileMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref dpApi
+      ResourceId: !Ref UploadFileRes
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - >-
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UPLOAD_LAMBDA}/invocations
+          - UPLOAD_LAMBDA: !GetAtt UploadToS3.Arn
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: $input.json('$')
+            ResponseParameters:
+                method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+                method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+                method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: $input.json('$')
+      RequestParameters:
+        method.request.querystring.name: false
+      MethodResponses:
+        - ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          StatusCode: '200'
+    DependsOn:
+      - UploadFileRes
+      - UploadToS3
+
+  UploadFilesDep:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref dpApi
+      StageName: prod
+    DependsOn:
+      - UploadFileMethod
+
+  UploadFilePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UploadToS3
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${dpApi}/*/*/*"
+    DependsOn:
+      - UploadFilesDep
+
+
+  SendNotificationRes:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref dpApi
+      ParentId: !GetAtt
+        - dpApi
+        - RootResourceId
+      PathPart: send-notification
+    DependsOn:
+      - dpApi
+
+  RestApiCORSOptionSendNotificationMethod:
+    Type: "AWS::ApiGateway::Method"
+    Properties:
+      ResourceId: !Ref SendNotificationRes
+      RestApiId: !Ref dpApi
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+            StatusCode: '200'
+        PassthroughBehavior: NEVER
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          StatusCode: '200'
+
+  SendNotificationMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref dpApi
+      ResourceId: !Ref SendNotificationRes
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - >-
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UPLOAD_LAMBDA}/invocations
+          - UPLOAD_LAMBDA: !GetAtt NotificationHandler.Arn
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: $input.json('$')
+            ResponseParameters:
+                method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+                method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+                method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: $input.json('$')
+      RequestParameters:
+        method.request.querystring.name: false
+      MethodResponses:
+        - ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          StatusCode: '200'
+    DependsOn:
+      - SendNotificationRes
+      - NotificationHandler
+  
+  SendNotificationDep:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref dpApi
+      StageName: prod
+    DependsOn:
+      - SendNotificationMethod
+
+  SendNotificationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NotificationHandler
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${dpApi}/*/*/*"
+    DependsOn:
+      - SendNotificationDep
+
+  DownloadLinkRes:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref dpApi
+      ParentId: !GetAtt
+        - dpApi
+        - RootResourceId
+      PathPart: download-csv
+    DependsOn:
+      - dpApi
+
+  RestApiCORSOptionDownloadMethod:
+      Type: "AWS::ApiGateway::Method"
+      Properties:
+        ResourceId: !Ref DownloadLinkRes
+        RestApiId: !Ref dpApi
+        AuthorizationType: NONE
+        HttpMethod: OPTIONS
+        Integration:
+          Type: MOCK
+          IntegrationResponses:
+            - ResponseParameters:
+                method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+                method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+                method.response.header.Access-Control-Allow-Origin: "'*'"
+              ResponseTemplates:
+                application/json: ''
+              StatusCode: '200'
+          PassthroughBehavior: NEVER
+          RequestTemplates:
+            application/json: '{"statusCode": 200}'
+        MethodResponses:
+          - ResponseModels:
+              application/json: Empty
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: true
+              method.response.header.Access-Control-Allow-Methods: true
+              method.response.header.Access-Control-Allow-Origin: true
+            StatusCode: '200'
+
+  DownloadLinkMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref dpApi
+      ResourceId: !Ref DownloadLinkRes
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - >-
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UPLOAD_LAMBDA}/invocations
+          - UPLOAD_LAMBDA: !GetAtt DownloadLink.Arn
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: $input.json('$')
+            ResponseParameters:
+                method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+                method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+                method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: $input.json('$')
+      RequestParameters:
+        method.request.querystring.name: false
+      MethodResponses:
+        - ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          StatusCode: '200'
+    DependsOn:
+      - DownloadLinkRes
+      - DownloadLink
+  
+  DownloadLinkDep:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref dpApi
+      StageName: prod
+    DependsOn:
+      - DownloadLinkMethod
+
+  DownloadLinkPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DownloadLink
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${dpApi}/*/*/*"
+    DependsOn:
+      - DownloadLinkDep
+  
